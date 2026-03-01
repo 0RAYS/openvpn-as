@@ -1,0 +1,111 @@
+name: Sync openvpn-as
+
+on:
+  schedule:
+    - cron: '0 2 * * *'   # daily at 02:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: sync-openvpn-as
+  cancel-in-progress: false  # queue rather than cancel overlapping runs
+
+permissions:
+  contents: write   # to commit built-digests.json back
+  packages: write   # to push to ghcr.io
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Sync images
+        env:
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          python3 << 'PYEOF'
+          import json, os, subprocess, urllib.request
+
+          # 1. Fetch all tags from Docker Hub (with pagination)
+          upstream = {}
+          url = "https://hub.docker.com/v2/repositories/openvpn/openvpn-as/tags/?page_size=100"
+          while url:
+              with urllib.request.urlopen(url) as r:
+                  data = json.loads(r.read())
+              for item in data.get("results", []):
+                  name, digest = item.get("name"), item.get("digest")
+                  if name and digest:
+                      upstream[name] = digest
+              url = data.get("next")
+
+          print(f"Found {len(upstream)} tags on Docker Hub.")
+
+          # 2. Load stored digests
+          digests_file = ".github/built-digests.json"
+          with open(digests_file) as f:
+              built = json.load(f)
+
+          # 3. Build and push changed/new tags
+          owner = os.environ["OWNER"].lower()   # ghcr.io requires lowercase
+          target_base = f"ghcr.io/{owner}/openvpn-as"
+          changed = False
+
+          for tag, digest in upstream.items():
+              if built.get(tag) == digest:
+                  print(f"[skip] {tag} (digest unchanged)")
+                  continue
+
+              base_image = f"openvpn/openvpn-as:{tag}"
+              target     = f"{target_base}:{tag}"
+              print(f"\n[build] {tag}")
+
+              ok = True
+              for cmd in [
+                  ["docker", "pull", base_image],
+                  ["docker", "build",
+                   "--build-arg", f"BASE_IMAGE={base_image}",
+                   "-t", target, "."],
+                  ["docker", "push", target],
+              ]:
+                  if subprocess.run(cmd).returncode != 0:
+                      print(f"[ERROR] failed: {' '.join(cmd)}")
+                      ok = False
+                      break
+
+              if ok:
+                  built[tag] = digest
+                  changed = True
+                  print(f"[ok] pushed {target}")
+
+          # 4. Persist updated digests
+          if changed:
+              with open(digests_file, "w") as f:
+                  json.dump(built, f, indent=2, sort_keys=True)
+                  f.write("\n")
+          PYEOF
+
+      - name: Commit built-digests.json
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/built-digests.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "chore: update built-digests.json [skip ci]"
+            git push origin main
+          fi
