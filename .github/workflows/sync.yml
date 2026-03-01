@@ -38,7 +38,9 @@ jobs:
           OWNER: ${{ github.repository_owner }}
         run: |
           python3 << 'PYEOF'
-          import json, os, subprocess, urllib.request
+          import json, os, re, subprocess, urllib.request
+
+          SEMVER = re.compile(r'^\d+\.\d+\.\d+')
 
           # 1. Fetch all tags from Docker Hub (with pagination)
           upstream = {}
@@ -48,11 +50,11 @@ jobs:
                   data = json.loads(r.read())
               for item in data.get("results", []):
                   name, digest = item.get("name"), item.get("digest")
-                  if name and digest:
+                  if name and digest and SEMVER.match(name):
                       upstream[name] = digest
               url = data.get("next")
 
-          print(f"Found {len(upstream)} tags on Docker Hub.")
+          print(f"Found {len(upstream)} versioned tags on Docker Hub.")
 
           # 2. Load stored digests
           digests_file = ".github/built-digests.json"
