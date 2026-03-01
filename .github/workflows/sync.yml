@@ -43,61 +43,68 @@ jobs:
           SEMVER = re.compile(r'^\d+\.\d+\.\d+')
 
           # 1. Fetch all tags from Docker Hub (with pagination)
-          upstream = {}
+          tags = {}
           url = "https://hub.docker.com/v2/repositories/openvpn/openvpn-as/tags/?page_size=100"
           while url:
               with urllib.request.urlopen(url) as r:
                   data = json.loads(r.read())
               for item in data.get("results", []):
                   name, digest = item.get("name"), item.get("digest")
-                  if name and digest and SEMVER.match(name):
-                      upstream[name] = digest
+                  if name and digest:
+                      tags[name] = digest
               url = data.get("next")
 
-          print(f"Found {len(upstream)} versioned tags on Docker Hub.")
+          # 2. Get latest digest and find matching versioned tag
+          latest_digest = tags.get("latest")
+          if not latest_digest:
+              print("No 'latest' tag found, exiting.")
+              exit(0)
 
-          # 2. Load stored digests
+          target_tag = next(
+              (name for name, digest in tags.items()
+               if SEMVER.match(name) and digest == latest_digest),
+              None
+          )
+          if not target_tag:
+              print(f"No versioned tag matches latest digest {latest_digest}")
+              exit(0)
+
+          print(f"Current latest: {target_tag} ({latest_digest})")
+
+          # 3. Check if already built
           digests_file = ".github/built-digests.json"
           with open(digests_file) as f:
               built = json.load(f)
 
-          # 3. Build and push changed/new tags
-          owner = os.environ["OWNER"].lower()   # ghcr.io requires lowercase
-          target_base = f"ghcr.io/{owner}/openvpn-as"
-          changed = False
+          if built.get(target_tag) == latest_digest:
+              print(f"[skip] {target_tag} already built.")
+              exit(0)
 
-          for tag, digest in upstream.items():
-              if built.get(tag) == digest:
-                  print(f"[skip] {tag} (digest unchanged)")
-                  continue
+          # 4. Build and push
+          owner = os.environ["OWNER"].lower()
+          base_image = f"openvpn/openvpn-as:{target_tag}"
+          target = f"ghcr.io/{owner}/openvpn-as:{target_tag}"
+          print(f"\n[build] {target_tag}")
 
-              base_image = f"openvpn/openvpn-as:{tag}"
-              target     = f"{target_base}:{tag}"
-              print(f"\n[build] {tag}")
+          ok = True
+          for cmd in [
+              ["docker", "pull", base_image],
+              ["docker", "build",
+               "--build-arg", f"BASE_IMAGE={base_image}",
+               "-t", target, "."],
+              ["docker", "push", target],
+          ]:
+              if subprocess.run(cmd).returncode != 0:
+                  print(f"[ERROR] failed: {' '.join(cmd)}")
+                  ok = False
+                  break
 
-              ok = True
-              for cmd in [
-                  ["docker", "pull", base_image],
-                  ["docker", "build",
-                   "--build-arg", f"BASE_IMAGE={base_image}",
-                   "-t", target, "."],
-                  ["docker", "push", target],
-              ]:
-                  if subprocess.run(cmd).returncode != 0:
-                      print(f"[ERROR] failed: {' '.join(cmd)}")
-                      ok = False
-                      break
-
-              if ok:
-                  built[tag] = digest
-                  changed = True
-                  print(f"[ok] pushed {target}")
-
-          # 4. Persist updated digests
-          if changed:
+          if ok:
+              built[target_tag] = latest_digest
               with open(digests_file, "w") as f:
                   json.dump(built, f, indent=2, sort_keys=True)
                   f.write("\n")
+              print(f"[ok] pushed {target}")
           PYEOF
 
       - name: Commit built-digests.json
